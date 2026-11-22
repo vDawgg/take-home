@@ -1,11 +1,11 @@
 """Seed the database with mock user install data.
 
-Creates the `user_installs` table (if needed) and streams 1,000,000
-(user_id, app_id) pairs into it using PostgreSQL's binary COPY. App IDs come
-from a universe of 200, and each user's installs overlap with the fixed
-candidate list in app_ids.json by a varying 0-100%. If the table already holds
-the expected number of rows, seeding is skipped, so restarting the database
-container does not refill it.
+Creates the `user_installs` table and its user_id index (if needed), then
+streams 1,000,000 (user_id, app_id) pairs into it using PostgreSQL's binary
+COPY. App IDs come from a universe of 200, and each user's installs overlap
+with the fixed candidate list in app_ids.json by a varying 0-100%. If the
+table already holds the expected number of rows, seeding is skipped, so
+restarting the database container does not refill it.
 
 Usage:
     uv run python seed.py [--force]
@@ -116,10 +116,22 @@ async def seed(database_url: str, force: bool = False) -> None:
 
     conn = await asyncpg.connect(database_url)
     try:
-        table_exists = await conn.fetchval(
-            "SELECT to_regclass('public.user_installs') IS NOT NULL"
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_installs (
+                user_id BIGINT NOT NULL,
+                app_id INTEGER NOT NULL
+            )
+            """
         )
-        if table_exists and not force:
+        await conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS user_installs_user_id_idx
+            ON user_installs (user_id)
+            """
+        )
+
+        if not force:
             stored_rows = await conn.fetchval("SELECT count(*) FROM user_installs")
             if stored_rows == total_rows:
                 print(f"user_installs already has {stored_rows:,} rows; skipping seed")
@@ -135,14 +147,6 @@ async def seed(database_url: str, force: bool = False) -> None:
             f"(avg {sum(overlap_percentages) / USER_COUNT:.1f}%)"
         )
 
-        await conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS user_installs (
-                user_id BIGINT NOT NULL,
-                app_id INTEGER NOT NULL
-            )
-            """
-        )
         await conn.execute("TRUNCATE user_installs")
 
         started = time.perf_counter()
