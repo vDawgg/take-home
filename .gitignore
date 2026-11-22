@@ -9,5 +9,8 @@ wheels/
 # Virtual environments
 .venv
 
+# Generated load-test results
+results/
+
 notes/
 
