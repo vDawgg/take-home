@@ -9,6 +9,7 @@ from fastapi import FastAPI
 
 from base.db import init_db_pool
 from core.router import router
+from core.service import load_candidate_app_ids
 
 load_dotenv()
 
@@ -23,6 +24,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     async with init_db_pool(database_url) as pool:
         app.state.db_pool = pool
+        app.state.candidate_app_ids = load_candidate_app_ids()
         yield
 
 

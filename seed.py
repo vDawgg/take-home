@@ -1,9 +1,11 @@
 """Seed the database with mock user install data.
 
 Creates the `user_installs` table (if needed) and streams 1,000,000
-(user_id, app_id) pairs into it using PostgreSQL's binary COPY. If the table
-already holds the expected number of rows, seeding is skipped, so restarting
-the database container does not refill it.
+(user_id, app_id) pairs into it using PostgreSQL's binary COPY. App IDs come
+from a universe of 200, and each user's installs overlap with the fixed
+candidate list in app_ids.json by a varying 0-100%. If the table already holds
+the expected number of rows, seeding is skipped, so restarting the database
+container does not refill it.
 
 Usage:
     uv run python seed.py [--force]
@@ -21,11 +23,13 @@ from collections.abc import Iterator
 import asyncpg
 from dotenv import load_dotenv
 
+from core.service import load_candidate_app_ids
+
 load_dotenv()
 
 USER_COUNT = 20_000
 TOTAL_ROWS = 1_000_000
-APP_COUNT = 10_000
+APP_COUNT = 200
 INSTALL_STDDEV = 10
 MAX_INSTALLS_PER_USER = 200
 RANDOM_SEED = 42
@@ -64,12 +68,35 @@ def build_install_counts(rng: random.Random) -> list[int]:
 
 
 def generate_installs(
-    counts: list[int], rng: random.Random
+    counts: list[int],
+    overlap_percentages: list[int],
+    candidate_app_ids: list[int],
+    rng: random.Random,
 ) -> Iterator[tuple[int, int]]:
-    """Stream distinct (user_id, app_id) pairs without materializing them."""
-    app_ids = range(1, APP_COUNT + 1)
-    for user_id, install_count in enumerate(counts, start=1):
-        for app_id in rng.sample(app_ids, install_count):
+    """Stream distinct (user_id, app_id) pairs without materializing them.
+
+    A user's overlap of 0% means none of their installs are candidate apps,
+    while 100% means all of their installs are candidate apps.
+    """
+    candidate_set = set(candidate_app_ids)
+    other_app_ids = [
+        app_id for app_id in range(1, APP_COUNT + 1) if app_id not in candidate_set
+    ]
+
+    for user_id, (install_count, overlap_percentage) in enumerate(
+        zip(counts, overlap_percentages), start=1
+    ):
+        overlap_count = round(install_count * overlap_percentage / 100)
+        overlap_count = min(overlap_count, len(candidate_app_ids), install_count)
+        overlap_count = max(overlap_count, install_count - len(other_app_ids))
+
+        installed_app_ids = rng.sample(candidate_app_ids, overlap_count)
+        installed_app_ids += rng.sample(
+            other_app_ids, install_count - overlap_count
+        )
+        rng.shuffle(installed_app_ids)
+
+        for app_id in installed_app_ids:
             yield user_id, app_id
 
 
@@ -77,6 +104,15 @@ async def seed(database_url: str, force: bool = False) -> None:
     counts = build_install_counts(random.Random(RANDOM_SEED))
     total_rows = sum(counts)
     rng = random.Random(RANDOM_SEED + 1)
+    overlap_percentages = [rng.randint(0, 100) for _ in range(USER_COUNT)]
+    candidate_app_ids = load_candidate_app_ids()
+
+    if any(
+        app_id < 1 or app_id > APP_COUNT for app_id in candidate_app_ids
+    ):
+        raise ValueError(
+            f"app_ids.json must contain IDs between 1 and {APP_COUNT}"
+        )
 
     conn = await asyncpg.connect(database_url)
     try:
@@ -93,7 +129,10 @@ async def seed(database_url: str, force: bool = False) -> None:
             f"Seeding {total_rows:,} installs for {USER_COUNT:,} users "
             f"across {APP_COUNT:,} apps "
             f"(min {min(counts)}, max {max(counts)}, "
-            f"avg {total_rows / USER_COUNT:.1f})"
+            f"avg {total_rows / USER_COUNT:.1f}); "
+            f"overlap with {len(candidate_app_ids)} candidate apps: "
+            f"{min(overlap_percentages)}-{max(overlap_percentages)}% "
+            f"(avg {sum(overlap_percentages) / USER_COUNT:.1f}%)"
         )
 
         await conn.execute(
@@ -109,7 +148,12 @@ async def seed(database_url: str, force: bool = False) -> None:
         started = time.perf_counter()
         await conn.copy_records_to_table(
             "user_installs",
-            records=generate_installs(counts, rng),
+            records=generate_installs(
+                counts,
+                overlap_percentages,
+                candidate_app_ids,
+                rng,
+            ),
             columns=("user_id", "app_id"),
         )
         elapsed = time.perf_counter() - started

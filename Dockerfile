@@ -9,7 +9,7 @@ ENV UV_COMPILE_BYTECODE=1 \
 COPY pyproject.toml uv.lock README.md ./
 RUN uv sync --frozen --no-dev --no-install-project
 
-COPY main.py seed.py ./
+COPY main.py seed.py app_ids.json ./
 COPY base ./base
 COPY core ./core
 

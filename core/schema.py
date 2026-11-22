@@ -1,10 +1,6 @@
-"""Request and response schemas for the offers endpoint."""
+"""Response schema for the offers endpoint."""
 
 from pydantic import BaseModel
-
-
-class OffersRequest(BaseModel):
-    app_ids: list[int]
 
 
 class OffersResponse(BaseModel):
