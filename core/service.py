@@ -16,11 +16,11 @@ def load_candidate_app_ids(path: Path = APP_IDS_PATH) -> list[int]:
 
 async def fetch_installed_app_ids(pool: asyncpg.Pool, user_id: int) -> set[int]:
     """Return the app IDs the user has already installed."""
-    rows = await pool.fetch(
-        "SELECT app_id FROM user_installs WHERE user_id = $1",
+    app_ids = await pool.fetchval(
+        "SELECT app_ids FROM user_installs WHERE user_id = $1",
         user_id,
     )
-    return {row["app_id"] for row in rows}
+    return set(app_ids or [])
 
 
 def filter_uninstalled_app_ids(

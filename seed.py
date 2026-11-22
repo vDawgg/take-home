@@ -1,11 +1,11 @@
 """Seed the database with mock user install data.
 
-Creates the `user_installs` table and its user_id index (if needed), then
-streams 1,000,000 (user_id, app_id) pairs into it using PostgreSQL's binary
-COPY. App IDs come from a universe of 200, and each user's installs overlap
-with the fixed candidate list in app_ids.json by a varying 0-100%. If the
-table already holds the expected number of rows, seeding is skipped, so
-restarting the database container does not refill it.
+Creates a read-optimized `user_installs` table with one row per user and an
+array of installed app IDs, then streams 20,000 rows covering 1,000,000
+installs using PostgreSQL's binary COPY. App IDs come from a universe of 200,
+and each user's installs overlap with the fixed candidate list in app_ids.json
+by a varying 0-100%. If the table already holds the expected data, seeding is
+skipped, so restarting the database container does not refill it.
 
 Usage:
     uv run python seed.py [--force]
@@ -28,7 +28,7 @@ from core.service import load_candidate_app_ids
 load_dotenv()
 
 USER_COUNT = 20_000
-TOTAL_ROWS = 1_000_000
+TOTAL_INSTALLS = 1_000_000
 APP_COUNT = 200
 INSTALL_STDDEV = 10
 MAX_INSTALLS_PER_USER = 200
@@ -36,12 +36,12 @@ RANDOM_SEED = 42
 
 
 def build_install_counts(rng: random.Random) -> list[int]:
-    """Return one install count per user, summing exactly to TOTAL_ROWS.
+    """Return one install count per user, summing exactly to TOTAL_INSTALLS.
 
-    Counts vary around the mean (TOTAL_ROWS / USER_COUNT) following a normal
-    distribution, then get nudged until the total is exact.
+    Counts vary around the mean (TOTAL_INSTALLS / USER_COUNT) following a
+    normal distribution, then get nudged until the total is exact.
     """
-    mean = TOTAL_ROWS / USER_COUNT
+    mean = TOTAL_INSTALLS / USER_COUNT
     max_count = min(APP_COUNT, MAX_INSTALLS_PER_USER)
     if not 1 <= mean <= max_count:
         raise ValueError(
@@ -53,7 +53,7 @@ def build_install_counts(rng: random.Random) -> list[int]:
         for _ in range(USER_COUNT)
     ]
 
-    delta = TOTAL_ROWS - sum(counts)
+    delta = TOTAL_INSTALLS - sum(counts)
     index = 0
     while delta:
         if delta > 0 and counts[index] < max_count:
@@ -67,13 +67,13 @@ def build_install_counts(rng: random.Random) -> list[int]:
     return counts
 
 
-def generate_installs(
+def generate_user_installs(
     counts: list[int],
     overlap_percentages: list[int],
     candidate_app_ids: list[int],
     rng: random.Random,
-) -> Iterator[tuple[int, int]]:
-    """Stream distinct (user_id, app_id) pairs without materializing them.
+) -> Iterator[tuple[int, list[int]]]:
+    """Stream one (user_id, app_ids array) record per user.
 
     A user's overlap of 0% means none of their installs are candidate apps,
     while 100% means all of their installs are candidate apps.
@@ -94,15 +94,25 @@ def generate_installs(
         installed_app_ids += rng.sample(
             other_app_ids, install_count - overlap_count
         )
-        rng.shuffle(installed_app_ids)
+        installed_app_ids.sort()
 
-        for app_id in installed_app_ids:
-            yield user_id, app_id
+        yield user_id, installed_app_ids
+
+
+async def create_schema(conn: asyncpg.Connection) -> None:
+    await conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_installs (
+            user_id BIGINT PRIMARY KEY,
+            app_ids INTEGER[] NOT NULL
+        )
+        """
+    )
 
 
 async def seed(database_url: str, force: bool = False) -> None:
     counts = build_install_counts(random.Random(RANDOM_SEED))
-    total_rows = sum(counts)
+    total_installs = sum(counts)
     rng = random.Random(RANDOM_SEED + 1)
     overlap_percentages = [rng.randint(0, 100) for _ in range(USER_COUNT)]
     candidate_app_ids = load_candidate_app_ids()
@@ -116,32 +126,33 @@ async def seed(database_url: str, force: bool = False) -> None:
 
     conn = await asyncpg.connect(database_url)
     try:
-        await conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS user_installs (
-                user_id BIGINT NOT NULL,
-                app_id INTEGER NOT NULL
-            )
-            """
-        )
-        await conn.execute(
-            """
-            CREATE INDEX IF NOT EXISTS user_installs_user_id_idx
-            ON user_installs (user_id)
-            """
-        )
+        await create_schema(conn)
 
         if not force:
-            stored_rows = await conn.fetchval("SELECT count(*) FROM user_installs")
-            if stored_rows == total_rows:
-                print(f"user_installs already has {stored_rows:,} rows; skipping seed")
+            stored_users = await conn.fetchval(
+                "SELECT count(*) FROM user_installs"
+            )
+            stored_installs = await conn.fetchval(
+                """
+                SELECT coalesce(sum(cardinality(app_ids)), 0)
+                FROM user_installs
+                """
+            )
+            if (
+                stored_users == USER_COUNT
+                and stored_installs == total_installs
+            ):
+                print(
+                    f"user_installs already has {stored_users:,} users and "
+                    f"{stored_installs:,} installs; skipping seed"
+                )
                 return
 
         print(
-            f"Seeding {total_rows:,} installs for {USER_COUNT:,} users "
+            f"Seeding {USER_COUNT:,} rows / {total_installs:,} installs "
             f"across {APP_COUNT:,} apps "
             f"(min {min(counts)}, max {max(counts)}, "
-            f"avg {total_rows / USER_COUNT:.1f}); "
+            f"avg {total_installs / USER_COUNT:.1f}); "
             f"overlap with {len(candidate_app_ids)} candidate apps: "
             f"{min(overlap_percentages)}-{max(overlap_percentages)}% "
             f"(avg {sum(overlap_percentages) / USER_COUNT:.1f}%)"
@@ -152,26 +163,42 @@ async def seed(database_url: str, force: bool = False) -> None:
         started = time.perf_counter()
         await conn.copy_records_to_table(
             "user_installs",
-            records=generate_installs(
+            records=generate_user_installs(
                 counts,
                 overlap_percentages,
                 candidate_app_ids,
                 rng,
             ),
-            columns=("user_id", "app_id"),
+            columns=("user_id", "app_ids"),
         )
         elapsed = time.perf_counter() - started
 
-        stored_rows = await conn.fetchval("SELECT count(*) FROM user_installs")
+        stored_users = await conn.fetchval(
+            "SELECT count(*) FROM user_installs"
+        )
+        stored_installs = await conn.fetchval(
+            """
+            SELECT coalesce(sum(cardinality(app_ids)), 0)
+            FROM user_installs
+            """
+        )
     finally:
         await conn.close()
 
-    if stored_rows != total_rows:
-        raise RuntimeError(f"Expected {total_rows:,} rows, found {stored_rows:,}")
+    if stored_users != USER_COUNT:
+        raise RuntimeError(
+            f"Expected {USER_COUNT:,} user rows, found {stored_users:,}"
+        )
+    if stored_installs != total_installs:
+        raise RuntimeError(
+            f"Expected {total_installs:,} installs, "
+            f"found {stored_installs:,}"
+        )
 
     print(
-        f"Copied {stored_rows:,} rows in {elapsed:.2f}s "
-        f"({stored_rows / elapsed:,.0f} rows/s)"
+        f"Copied {stored_users:,} user rows "
+        f"({stored_installs:,} installs) in {elapsed:.2f}s "
+        f"({stored_users / elapsed:,.0f} rows/s)"
     )
 
 
