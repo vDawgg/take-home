@@ -1,0 +1,3 @@
+- use uv for all python-related functionality
+- work incrementally
+- do not burry yourself in long experiments before reporting back to the user
