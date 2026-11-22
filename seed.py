@@ -1,14 +1,17 @@
 """Seed the database with mock user install data.
 
-Creates the `user_installs` table (if needed), clears it, and streams
-1,000,000 (user_id, app_id) pairs into it using PostgreSQL's binary COPY.
+Creates the `user_installs` table (if needed) and streams 1,000,000
+(user_id, app_id) pairs into it using PostgreSQL's binary COPY. If the table
+already holds the expected number of rows, seeding is skipped, so restarting
+the database container does not refill it.
 
 Usage:
-    uv run python seed.py
+    uv run python seed.py [--force]
 
 DATABASE_URL is read from the .env file.
 """
 
+import argparse
 import asyncio
 import os
 import random
@@ -70,19 +73,29 @@ def generate_installs(
             yield user_id, app_id
 
 
-async def seed(database_url: str) -> None:
+async def seed(database_url: str, force: bool = False) -> None:
     counts = build_install_counts(random.Random(RANDOM_SEED))
     total_rows = sum(counts)
     rng = random.Random(RANDOM_SEED + 1)
 
-    print(
-        f"Seeding {total_rows:,} installs for {USER_COUNT:,} users "
-        f"across {APP_COUNT:,} apps "
-        f"(min {min(counts)}, max {max(counts)}, avg {total_rows / USER_COUNT:.1f})"
-    )
-
     conn = await asyncpg.connect(database_url)
     try:
+        table_exists = await conn.fetchval(
+            "SELECT to_regclass('public.user_installs') IS NOT NULL"
+        )
+        if table_exists and not force:
+            stored_rows = await conn.fetchval("SELECT count(*) FROM user_installs")
+            if stored_rows == total_rows:
+                print(f"user_installs already has {stored_rows:,} rows; skipping seed")
+                return
+
+        print(
+            f"Seeding {total_rows:,} installs for {USER_COUNT:,} users "
+            f"across {APP_COUNT:,} apps "
+            f"(min {min(counts)}, max {max(counts)}, "
+            f"avg {total_rows / USER_COUNT:.1f})"
+        )
+
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS user_installs (
@@ -114,10 +127,23 @@ async def seed(database_url: str) -> None:
     )
 
 
-if __name__ == "__main__":
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Seed the user_installs table.")
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="truncate and reseed even if the table is already populated",
+    )
+    args = parser.parse_args()
+
     database_url = os.getenv("DATABASE_URL")
     if not database_url:
         raise SystemExit(
             "DATABASE_URL is not set. Add it to a .env file in the project root."
         )
-    asyncio.run(seed(database_url))
+
+    asyncio.run(seed(database_url, force=args.force))
+
+
+if __name__ == "__main__":
+    main()
