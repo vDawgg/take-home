@@ -7,7 +7,7 @@ import asyncpg
 from cashews import cache
 
 APP_IDS_PATH = Path(__file__).resolve().parents[1] / "app_ids.json"
-CACHE_TTL_SECONDS = 1
+CACHE_TTL_SECONDS = 10
 CACHE_MAX_SIZE = 1024
 
 cache.setup("mem://", size=CACHE_MAX_SIZE)

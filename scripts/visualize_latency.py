@@ -3,7 +3,7 @@
 Usage:
     uv run python scripts/visualize_latency.py
 
-Each results/<name>.csv gets a matching results/<name>.png chart.
+Each results/<name>.csv gets a matching results/<name>.pdf chart.
 """
 
 import csv
@@ -198,7 +198,7 @@ def create_chart(
     histogram.grid(alpha=0.3)
     histogram.legend()
 
-    output = csv_path.with_suffix(".png")
+    output = csv_path.with_suffix(".pdf")
     figure.savefig(output, dpi=150)
     plt.close(figure)
 
