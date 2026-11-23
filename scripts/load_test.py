@@ -1,6 +1,8 @@
 """Send rate-limited requests to the offers endpoint and record latencies.
 
-Usage:
+The target request rate is split across multiple worker processes
+automatically, each running its own asyncio event loop. Usage:
+
     uv run python scripts/load_test.py --rate 100
 
 Writes one CSV row per request to a timestamped file under results/.
@@ -10,8 +12,11 @@ import argparse
 import asyncio
 import csv
 import math
+import multiprocessing
+import os
 import random
 import time
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,6 +26,7 @@ import httpx
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 RESULTS_DIR = PROJECT_ROOT / "results"
 DEFAULT_MAX_USER_ID = 20_000
+REQUESTS_PER_SECOND_PER_WORKER = 500
 
 
 @dataclass
@@ -29,6 +35,8 @@ class Result:
     user_id: int
     status_code: int
     latency_ms: float
+    process_ms: float | None
+    db_ms: float | None
     started_s: float
     finished_s: float
 
@@ -48,17 +56,38 @@ def percentile(sorted_values: list[float], fraction: float) -> float:
     )
 
 
+def header_ms(headers: httpx.Headers, name: str) -> float | None:
+    value = headers.get(name)
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
+def worker_count_for(rate: float, requests: int) -> int:
+    """Choose enough workers to keep each below its sustainable rate."""
+    required = math.ceil(rate / REQUESTS_PER_SECOND_PER_WORKER)
+    return max(1, min(required, requests, os.cpu_count() or 1))
+
+
 async def send_request(
     client: httpx.AsyncClient,
     url: str,
     request_index: int,
     user_id: int,
-    test_start: float,
+    start_epoch: float,
 ) -> Result:
     started = time.perf_counter()
+    started_s = time.time() - start_epoch
+    process_ms = None
+    db_ms = None
     try:
         response = await client.get(url, params={"user_id": user_id})
         status_code = response.status_code
+        process_ms = header_ms(response.headers, "x-process-time-ms")
+        db_ms = header_ms(response.headers, "x-db-time-ms")
     except httpx.HTTPError:
         status_code = 0
     finished = time.perf_counter()
@@ -68,17 +97,88 @@ async def send_request(
         user_id=user_id,
         status_code=status_code,
         latency_ms=(finished - started) * 1000,
-        started_s=started - test_start,
-        finished_s=finished - test_start,
+        process_ms=process_ms,
+        db_ms=db_ms,
+        started_s=started_s,
+        finished_s=time.time() - start_epoch,
     )
 
 
-async def run_load_test(args: argparse.Namespace) -> list[Result]:
+def run_worker(
+    url: str,
+    timeout: float,
+    rate: float,
+    start_epoch: float,
+    requests: list[tuple[int, int]],
+) -> list[Result]:
+    """Run one worker process with its own async event loop."""
+    return asyncio.run(
+        run_worker_async(url, timeout, rate, start_epoch, requests)
+    )
+
+
+async def run_worker_async(
+    url: str,
+    timeout: float,
+    rate: float,
+    start_epoch: float,
+    requests: list[tuple[int, int]],
+) -> list[Result]:
+    interval = 1.0 / rate
+    limits = httpx.Limits()
+
+    async with httpx.AsyncClient(
+        limits=limits,
+        timeout=timeout,
+    ) as client:
+        worker_start = time.time()
+
+        tasks: list[asyncio.Task[Result]] = []
+        for offset, (request_index, user_id) in enumerate(requests):
+            target = worker_start + offset * interval
+            delay = target - time.time()
+            if delay > 0:
+                await asyncio.sleep(delay)
+
+            tasks.append(
+                asyncio.create_task(
+                    send_request(
+                        client,
+                        url,
+                        request_index,
+                        user_id,
+                        start_epoch,
+                    )
+                )
+            )
+
+        return await asyncio.gather(*tasks)
+
+
+def split_requests(
+    user_ids: list[int],
+    workers: int,
+) -> list[list[tuple[int, int]]]:
+    """Interleave requests across workers while keeping global indices."""
+    return [
+        [
+            (request_index, user_ids[request_index])
+            for request_index in range(worker_index, len(user_ids), workers)
+        ]
+        for worker_index in range(workers)
+    ]
+
+
+def run_load_test(args: argparse.Namespace) -> list[Result]:
     rng = random.Random(args.seed)
     user_ids = [
         rng.randint(1, args.max_user_id) for _ in range(args.requests)
     ]
-    interval = 1.0 / args.rate
+
+    workers = worker_count_for(args.rate, args.requests)
+    worker_rate = args.rate / workers
+    assignments = split_requests(user_ids, workers)
+
     now = datetime.now(timezone.utc)
     timestamp = now.strftime("%d-%m-%Y_%H-%M")
     name = f"latency_{timestamp}_{args.requests}req_{args.rate:g}rps"
@@ -88,38 +188,41 @@ async def run_load_test(args: argparse.Namespace) -> list[Result]:
         output = RESULTS_DIR / f"{name}_{suffix}.csv"
         suffix += 1
 
-    # Override httpx's default 100-connection cap so the request rate is the
-    # only thing controlling load; concurrency follows from rate and latency.
-    limits = httpx.Limits()
+    print(
+        f"Using {workers} worker process(es) at {worker_rate:g} req/s each"
+    )
 
-    async with httpx.AsyncClient(
-        limits=limits,
-        timeout=args.timeout,
-    ) as client:
-        test_start = time.perf_counter()
-        tasks: list[asyncio.Task[Result]] = []
-
-        for request_index, user_id in enumerate(user_ids):
-            target = test_start + request_index * interval
-            delay = target - time.perf_counter()
-            if delay > 0:
-                await asyncio.sleep(delay)
-
-            tasks.append(
-                asyncio.create_task(
-                    send_request(
-                        client,
-                        args.url,
-                        request_index,
-                        user_id,
-                        test_start,
-                    )
+    start_epoch = time.time()
+    if workers > 1:
+        mp_context = multiprocessing.get_context("fork")
+        with ProcessPoolExecutor(
+            max_workers=workers,
+            mp_context=mp_context,
+        ) as executor:
+            futures = [
+                executor.submit(
+                    run_worker,
+                    args.url,
+                    args.timeout,
+                    worker_rate,
+                    start_epoch,
+                    assignment,
                 )
-            )
+                for assignment in assignments
+            ]
+            results: list[Result] = []
+            for future in futures:
+                results.extend(future.result())
+    else:
+        results = run_worker(
+            args.url,
+            args.timeout,
+            worker_rate,
+            start_epoch,
+            assignments[0],
+        )
 
-        results = await asyncio.gather(*tasks)
-        wall_time = time.perf_counter() - test_start
-
+    wall_time = time.time() - start_epoch
     results.sort(key=lambda result: result.request_index)
     write_results(results, output)
 
@@ -127,6 +230,14 @@ async def run_load_test(args: argparse.Namespace) -> list[Result]:
         result for result in results if 200 <= result.status_code < 300
     ]
     latencies = sorted(result.latency_ms for result in successful)
+    process_times = sorted(
+        result.process_ms
+        for result in successful
+        if result.process_ms is not None
+    )
+    db_times = sorted(
+        result.db_ms for result in successful if result.db_ms is not None
+    )
     failed = len(results) - len(successful)
 
     print(
@@ -136,19 +247,26 @@ async def run_load_test(args: argparse.Namespace) -> list[Result]:
     print(f"Successful: {len(successful)}, failed: {failed}")
 
     if latencies:
-        p95 = percentile(latencies, 0.95)
-        print(
-            "Latency (ms): "
-            f"min={latencies[0]:.1f}, "
-            f"mean={sum(latencies) / len(latencies):.1f}, "
-            f"p50={percentile(latencies, 0.50):.1f}, "
-            f"p95={p95:.1f}, "
-            f"p99={percentile(latencies, 0.99):.1f}, "
-            f"max={latencies[-1]:.1f}"
-        )
+        print_latency_stats("Client latency", latencies)
+    if process_times:
+        print_latency_stats("Server process", process_times)
+    if db_times:
+        print_latency_stats("DB query", db_times)
 
     print(f"Results written to {output}")
     return results
+
+
+def print_latency_stats(label: str, values: list[float]) -> None:
+    print(
+        f"{label} (ms): "
+        f"min={values[0]:.1f}, "
+        f"mean={sum(values) / len(values):.1f}, "
+        f"p50={percentile(values, 0.50):.1f}, "
+        f"p95={percentile(values, 0.95):.1f}, "
+        f"p99={percentile(values, 0.99):.1f}, "
+        f"max={values[-1]:.1f}"
+    )
 
 
 def write_results(results: list[Result], output: Path) -> None:
@@ -161,6 +279,8 @@ def write_results(results: list[Result], output: Path) -> None:
                 "user_id",
                 "status_code",
                 "latency_ms",
+                "process_ms",
+                "db_ms",
                 "started_s",
                 "finished_s",
             ]
@@ -172,6 +292,16 @@ def write_results(results: list[Result], output: Path) -> None:
                     result.user_id,
                     result.status_code,
                     f"{result.latency_ms:.3f}",
+                    (
+                        f"{result.process_ms:.3f}"
+                        if result.process_ms is not None
+                        else ""
+                    ),
+                    (
+                        f"{result.db_ms:.3f}"
+                        if result.db_ms is not None
+                        else ""
+                    ),
                     f"{result.started_s:.6f}",
                     f"{result.finished_s:.6f}",
                 ]
@@ -221,4 +351,4 @@ def parse_args() -> argparse.Namespace:
 
 
 if __name__ == "__main__":
-    asyncio.run(run_load_test(parse_args()))
+    run_load_test(parse_args())

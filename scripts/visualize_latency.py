@@ -1,14 +1,14 @@
-"""Visualize load-test latencies and report p95.
+"""Generate latency charts for every CSV in the results directory.
 
 Usage:
-    uv run python scripts/visualize_latency.py results/latency_<run>.csv
+    uv run python scripts/visualize_latency.py
 
-The chart is written next to the CSV with a matching name and .png extension.
+Each results/<name>.csv gets a matching results/<name>.png chart.
 """
 
-import argparse
 import csv
 import math
+import re
 from pathlib import Path
 
 import matplotlib
@@ -16,6 +16,10 @@ import matplotlib
 matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+RESULTS_DIR = PROJECT_ROOT / "results"
+
 
 def percentile(sorted_values: list[float], fraction: float) -> float:
     """Return the linearly interpolated percentile of sorted values."""
@@ -32,6 +36,11 @@ def percentile(sorted_values: list[float], fraction: float) -> float:
     )
 
 
+def request_rate_from_filename(path: Path) -> float | None:
+    match = re.search(r"_(\d+(?:\.\d+)?)rps(?:_\d+)?\.csv$", path.name)
+    return float(match.group(1)) if match else None
+
+
 def load_latencies(path: Path) -> tuple[list[float], list[float]]:
     with path.open(newline="") as file:
         rows = [
@@ -45,25 +54,22 @@ def load_latencies(path: Path) -> tuple[list[float], list[float]]:
     return started, latencies
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Plot request latency and report p95."
-    )
-    parser.add_argument(
-        "csv_path",
-        type=Path,
-        help="Load-test CSV produced by scripts/load_test.py",
-    )
-    args = parser.parse_args()
-
-    started, latencies = load_latencies(args.csv_path)
+def create_chart(csv_path: Path) -> tuple[int, float, float, Path] | None:
+    started, latencies = load_latencies(csv_path)
     if not latencies:
-        raise SystemExit(f"No successful requests found in {args.csv_path}")
+        print(f"Skipping {csv_path.name}: no successful requests")
+        return None
 
     sorted_latencies = sorted(latencies)
     p50 = percentile(sorted_latencies, 0.50)
     p95 = percentile(sorted_latencies, 0.95)
     p99 = percentile(sorted_latencies, 0.99)
+    request_rate = request_rate_from_filename(csv_path)
+    rate_label = (
+        f"target {request_rate:g} req/s"
+        if request_rate is not None
+        else "unknown target rate"
+    )
 
     figure, (timeline, histogram) = plt.subplots(
         2,
@@ -72,7 +78,9 @@ def main() -> None:
         constrained_layout=True,
     )
     figure.suptitle(
-        f"Offers latency - {len(latencies)} requests, p95 = {p95:.1f} ms"
+        f"Offers latency - {rate_label}\n"
+        f"{len(latencies)} requests, "
+        f"p95 = {p95:.1f} ms, p99 = {p99:.1f} ms"
     )
 
     timeline.plot(
@@ -96,6 +104,13 @@ def main() -> None:
         linestyle="--",
         linewidth=1.5,
         label=f"p95 = {p95:.1f} ms",
+    )
+    timeline.axhline(
+        p99,
+        color="purple",
+        linestyle="-.",
+        linewidth=1.5,
+        label=f"p99 = {p99:.1f} ms",
     )
     timeline.set_xlabel("Elapsed time (s)")
     timeline.set_ylabel("Latency (ms)")
@@ -124,22 +139,52 @@ def main() -> None:
         linewidth=1.5,
         label=f"p95 = {p95:.1f} ms",
     )
+    histogram.axvline(
+        p99,
+        color="purple",
+        linestyle="-.",
+        linewidth=1.5,
+        label=f"p99 = {p99:.1f} ms",
+    )
     histogram.set_xlabel("Latency (ms)")
     histogram.set_ylabel("Requests")
     histogram.set_title("Latency distribution")
     histogram.grid(alpha=0.3)
     histogram.legend()
 
-    output = args.csv_path.with_suffix(".png")
-    output.parent.mkdir(parents=True, exist_ok=True)
+    output = csv_path.with_suffix(".png")
     figure.savefig(output, dpi=150)
+    plt.close(figure)
 
-    print(f"Requests: {len(latencies)}")
-    print(
-        f"p50={p50:.1f} ms, p95={p95:.1f} ms, p99={p99:.1f} ms, "
-        f"max={sorted_latencies[-1]:.1f} ms"
-    )
-    print(f"Chart written to {output}")
+    return len(latencies), request_rate, p95, p99, output
+
+
+def main() -> None:
+    csv_paths = sorted(RESULTS_DIR.glob("*.csv"))
+    if not csv_paths:
+        raise SystemExit(f"No CSV files found in {RESULTS_DIR}")
+
+    for index, csv_path in enumerate(csv_paths, start=1):
+        try:
+            result = create_chart(csv_path)
+        except (KeyError, ValueError) as error:
+            print(f"Skipping {csv_path.name}: {error}")
+            continue
+
+        if result is None:
+            continue
+
+        requests, request_rate, p95, p99, output = result
+        rate_text = (
+            f"{request_rate:g} req/s"
+            if request_rate is not None
+            else "unknown rate"
+        )
+        print(
+            f"[{index}/{len(csv_paths)}] {csv_path.name}: "
+            f"{requests} requests, target={rate_text}, "
+            f"p95={p95:.1f} ms, p99={p99:.1f} ms -> {output.name}"
+        )
 
 
 if __name__ == "__main__":

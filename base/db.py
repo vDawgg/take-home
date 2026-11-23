@@ -1,5 +1,6 @@
 """Asyncpg pool lifecycle."""
 
+import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -12,8 +13,8 @@ async def init_db_pool(database_url: str) -> AsyncIterator[asyncpg.Pool]:
     """Create the shared connection pool and yield it for the app lifetime."""
     pool = await asyncpg.create_pool(
         dsn=database_url,
-        min_size=1,
-        max_size=10,
+        min_size=int(os.getenv("DB_POOL_MIN_SIZE", "1")),
+        max_size=int(os.getenv("DB_POOL_MAX_SIZE", "10")),
     )
     try:
         yield pool

@@ -1,9 +1,10 @@
 """HTTP routes."""
 
+import time
 from typing import Annotated
 
 import asyncpg
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Request, Response
 
 from base.db import get_pool
 from core.schema import OffersResponse
@@ -20,11 +21,16 @@ def get_candidate_app_ids(request: Request) -> list[int]:
 @router.get("/offers", response_model=OffersResponse)
 async def get_offers(
     user_id: int,
+    response: Response,
     pool: Annotated[asyncpg.Pool, Depends(get_pool)],
     candidate_app_ids: Annotated[list[int], Depends(get_candidate_app_ids)],
 ) -> OffersResponse:
     """Return candidate apps the user has not installed yet."""
+    started = time.perf_counter()
     installed_app_ids = await fetch_installed_app_ids(pool, user_id)
+    db_elapsed_ms = (time.perf_counter() - started) * 1000
+    response.headers["X-DB-Time-Ms"] = f"{db_elapsed_ms:.3f}"
+
     return OffersResponse(
         user_id=user_id,
         app_ids=filter_uninstalled_app_ids(candidate_app_ids, installed_app_ids),

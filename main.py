@@ -1,11 +1,12 @@
 """FastAPI application entry point."""
 
 import os
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 
 from base.db import init_db_pool
 from core.router import router
@@ -30,3 +31,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(title="Almedia Take Home", lifespan=lifespan)
 app.include_router(router)
+
+
+@app.middleware("http")
+async def add_process_time_header(request: Request, call_next):
+    started = time.perf_counter()
+    response = await call_next(request)
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    response.headers["X-Process-Time-Ms"] = f"{elapsed_ms:.3f}"
+    return response
