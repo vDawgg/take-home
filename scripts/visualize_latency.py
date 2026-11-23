@@ -61,6 +61,7 @@ def create_chart(csv_path: Path) -> tuple[int, float, float, Path] | None:
         return None
 
     sorted_latencies = sorted(latencies)
+    average = sum(latencies) / len(latencies)
     p50 = percentile(sorted_latencies, 0.50)
     p95 = percentile(sorted_latencies, 0.95)
     p99 = percentile(sorted_latencies, 0.99)
@@ -79,7 +80,7 @@ def create_chart(csv_path: Path) -> tuple[int, float, float, Path] | None:
     )
     figure.suptitle(
         f"Offers latency - {rate_label}\n"
-        f"{len(latencies)} requests, "
+        f"{len(latencies)} requests, avg = {average:.1f} ms, "
         f"p95 = {p95:.1f} ms, p99 = {p99:.1f} ms"
     )
 
@@ -90,6 +91,13 @@ def create_chart(csv_path: Path) -> tuple[int, float, float, Path] | None:
         linestyle="none",
         alpha=0.6,
         label="requests",
+    )
+    timeline.axhline(
+        average,
+        color="green",
+        linestyle="--",
+        linewidth=1.5,
+        label=f"avg = {average:.1f} ms",
     )
     timeline.axhline(
         p50,
@@ -126,6 +134,13 @@ def create_chart(csv_path: Path) -> tuple[int, float, float, Path] | None:
         alpha=0.7,
     )
     histogram.axvline(
+        average,
+        color="green",
+        linestyle="--",
+        linewidth=1.5,
+        label=f"avg = {average:.1f} ms",
+    )
+    histogram.axvline(
         p50,
         color="orange",
         linestyle=":",
@@ -156,7 +171,7 @@ def create_chart(csv_path: Path) -> tuple[int, float, float, Path] | None:
     figure.savefig(output, dpi=150)
     plt.close(figure)
 
-    return len(latencies), request_rate, p95, p99, output
+    return len(latencies), request_rate, average, p95, p99, output
 
 
 def main() -> None:
@@ -174,7 +189,7 @@ def main() -> None:
         if result is None:
             continue
 
-        requests, request_rate, p95, p99, output = result
+        requests, request_rate, average, p95, p99, output = result
         rate_text = (
             f"{request_rate:g} req/s"
             if request_rate is not None
@@ -183,7 +198,8 @@ def main() -> None:
         print(
             f"[{index}/{len(csv_paths)}] {csv_path.name}: "
             f"{requests} requests, target={rate_text}, "
-            f"p95={p95:.1f} ms, p99={p99:.1f} ms -> {output.name}"
+            f"avg={average:.1f} ms, p95={p95:.1f} ms, "
+            f"p99={p99:.1f} ms -> {output.name}"
         )
 
 

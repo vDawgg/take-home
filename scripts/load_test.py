@@ -20,13 +20,16 @@ from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import httpx
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 RESULTS_DIR = PROJECT_ROOT / "results"
 DEFAULT_MAX_USER_ID = 20_000
-REQUESTS_PER_SECOND_PER_WORKER = 500
+# Keep each Python worker light enough to maintain its schedule even when
+# responses back up, so aggregate arrivals stay at the target rate.
+REQUESTS_PER_SECOND_PER_WORKER = 250
 
 
 @dataclass
@@ -77,10 +80,10 @@ async def send_request(
     url: str,
     request_index: int,
     user_id: int,
-    start_epoch: float,
+    worker_start: float,
 ) -> Result:
     started = time.perf_counter()
-    started_s = time.time() - start_epoch
+    started_s = time.time() - worker_start
     process_ms = None
     db_ms = None
     try:
@@ -100,7 +103,7 @@ async def send_request(
         process_ms=process_ms,
         db_ms=db_ms,
         started_s=started_s,
-        finished_s=time.time() - start_epoch,
+        finished_s=time.time() - worker_start,
     )
 
 
@@ -108,12 +111,13 @@ def run_worker(
     url: str,
     timeout: float,
     rate: float,
-    start_epoch: float,
     requests: list[tuple[int, int]],
+    ready: Any,
+    start: Any,
 ) -> list[Result]:
     """Run one worker process with its own async event loop."""
     return asyncio.run(
-        run_worker_async(url, timeout, rate, start_epoch, requests)
+        run_worker_async(url, timeout, rate, requests, ready, start)
     )
 
 
@@ -121,8 +125,9 @@ async def run_worker_async(
     url: str,
     timeout: float,
     rate: float,
-    start_epoch: float,
     requests: list[tuple[int, int]],
+    ready: Any,
+    start: Any,
 ) -> list[Result]:
     interval = 1.0 / rate
     limits = httpx.Limits()
@@ -131,6 +136,11 @@ async def run_worker_async(
         limits=limits,
         timeout=timeout,
     ) as client:
+        if ready is not None:
+            ready.put(1)
+            if not start.wait(timeout=30):
+                raise RuntimeError("Timed out waiting for synchronized start")
+
         worker_start = time.time()
 
         tasks: list[asyncio.Task[Result]] = []
@@ -147,7 +157,7 @@ async def run_worker_async(
                         url,
                         request_index,
                         user_id,
-                        start_epoch,
+                        worker_start,
                     )
                 )
             )
@@ -192,37 +202,45 @@ def run_load_test(args: argparse.Namespace) -> list[Result]:
         f"Using {workers} worker process(es) at {worker_rate:g} req/s each"
     )
 
-    start_epoch = time.time()
     if workers > 1:
         mp_context = multiprocessing.get_context("fork")
-        with ProcessPoolExecutor(
-            max_workers=workers,
-            mp_context=mp_context,
-        ) as executor:
-            futures = [
-                executor.submit(
-                    run_worker,
-                    args.url,
-                    args.timeout,
-                    worker_rate,
-                    start_epoch,
-                    assignment,
-                )
-                for assignment in assignments
-            ]
-            results: list[Result] = []
-            for future in futures:
-                results.extend(future.result())
+        with multiprocessing.Manager() as manager:
+            ready = manager.Queue()
+            start = manager.Event()
+            with ProcessPoolExecutor(
+                max_workers=workers,
+                mp_context=mp_context,
+            ) as executor:
+                futures = [
+                    executor.submit(
+                        run_worker,
+                        args.url,
+                        args.timeout,
+                        worker_rate,
+                        assignment,
+                        ready,
+                        start,
+                    )
+                    for assignment in assignments
+                ]
+
+                for _ in range(workers):
+                    ready.get(timeout=30)
+                start.set()
+
+                results: list[Result] = []
+                for future in futures:
+                    results.extend(future.result())
     else:
         results = run_worker(
             args.url,
             args.timeout,
             worker_rate,
-            start_epoch,
             assignments[0],
+            None,
+            None,
         )
 
-    wall_time = time.time() - start_epoch
     results.sort(key=lambda result: result.request_index)
     write_results(results, output)
 
@@ -240,11 +258,28 @@ def run_load_test(args: argparse.Namespace) -> list[Result]:
     )
     failed = len(results) - len(successful)
 
-    print(
-        f"Sent {len(results)} requests at {args.rate:g} req/s "
-        f"in {wall_time:.2f}s ({len(results) / wall_time:.1f} req/s effective)"
+    first_start = min(result.started_s for result in results)
+    last_start = max(result.started_s for result in results)
+    last_finish = max(result.finished_s for result in results)
+    arrival_window = max(last_start - first_start, 1e-9)
+    arrival_rate = (
+        (len(results) - 1) / arrival_window if len(results) > 1 else 0.0
     )
-    print(f"Successful: {len(successful)}, failed: {failed}")
+    completion_rate = len(results) / last_finish if last_finish > 0 else 0.0
+
+    print(
+        f"Requests: {len(results)} "
+        f"(successful: {len(successful)}, failed: {failed})"
+    )
+    print(f"Target rate: {args.rate:g} req/s")
+    print(
+        f"Arrival rate: {arrival_rate:.1f} req/s "
+        f"(requests started over {arrival_window:.2f}s)"
+    )
+    print(
+        f"Completion throughput: {completion_rate:.1f} req/s "
+        f"(last response after {last_finish:.2f}s)"
+    )
 
     if latencies:
         print_latency_stats("Client latency", latencies)
