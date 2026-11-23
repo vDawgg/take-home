@@ -26,7 +26,8 @@ import httpx
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 RESULTS_DIR = PROJECT_ROOT / "results"
-DEFAULT_MAX_USER_ID = 20_000
+DEFAULT_USERS = 1_000
+MAX_SEEDED_USER_ID = 20_000
 # Keep each Python worker light enough to maintain its schedule even when
 # responses back up, so aggregate arrivals stay at the target rate.
 REQUESTS_PER_SECOND_PER_WORKER = 250
@@ -181,9 +182,15 @@ def split_requests(
 
 def run_load_test(args: argparse.Namespace) -> list[Result]:
     rng = random.Random(args.seed)
-    user_ids = [
-        rng.randint(1, args.max_user_id) for _ in range(args.requests)
-    ]
+    if args.requests <= args.users:
+        # Unique users when the request count fits in the user pool.
+        user_ids = rng.sample(range(1, args.users + 1), args.requests)
+    else:
+        # Reuse users when there are more requests than users.
+        user_ids = [
+            rng.randint(1, args.users) for _ in range(args.requests)
+        ]
+    distinct_users = len(set(user_ids))
 
     workers = worker_count_for(args.rate, args.requests)
     worker_rate = args.rate / workers
@@ -191,7 +198,10 @@ def run_load_test(args: argparse.Namespace) -> list[Result]:
 
     now = datetime.now(timezone.utc)
     timestamp = now.strftime("%d-%m-%Y_%H-%M")
-    name = f"latency_{timestamp}_{args.requests}req_{args.rate:g}rps"
+    name = (
+        f"latency_{timestamp}_{args.requests}req_"
+        f"{args.rate:g}rps_{args.users}users"
+    )
     output = RESULTS_DIR / f"{name}.csv"
     suffix = 2
     while output.exists():
@@ -200,6 +210,10 @@ def run_load_test(args: argparse.Namespace) -> list[Result]:
 
     print(
         f"Using {workers} worker process(es) at {worker_rate:g} req/s each"
+    )
+    print(
+        f"User pool: {args.users} "
+        f"({distinct_users} distinct users in this run)"
     )
 
     if workers > 1:
@@ -365,10 +379,13 @@ def parse_args() -> argparse.Namespace:
         help="Target request rate in requests per second (default: 100)",
     )
     parser.add_argument(
-        "--max-user-id",
+        "--users",
         type=int,
-        default=DEFAULT_MAX_USER_ID,
-        help=f"Maximum seeded user ID (default: {DEFAULT_MAX_USER_ID})",
+        default=DEFAULT_USERS,
+        help=(
+            "Number of distinct users to draw from; lower values increase "
+            f"cache reuse (default: {DEFAULT_USERS})"
+        ),
     )
     parser.add_argument(
         "--seed",
@@ -382,7 +399,12 @@ def parse_args() -> argparse.Namespace:
         default=30.0,
         help="Per-request timeout in seconds (default: 30)",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if not 1 <= args.users <= MAX_SEEDED_USER_ID:
+        parser.error(
+            f"--users must be between 1 and {MAX_SEEDED_USER_ID}"
+        )
+    return args
 
 
 if __name__ == "__main__":

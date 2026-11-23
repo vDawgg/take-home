@@ -36,9 +36,18 @@ def percentile(sorted_values: list[float], fraction: float) -> float:
     )
 
 
-def request_rate_from_filename(path: Path) -> float | None:
-    match = re.search(r"_(\d+(?:\.\d+)?)rps(?:_\d+)?\.csv$", path.name)
-    return float(match.group(1)) if match else None
+def metadata_from_filename(
+    path: Path,
+) -> tuple[float | None, int | None]:
+    match = re.search(
+        r"_(\d+(?:\.\d+)?)rps(?:_(\d+)users)?(?:_\d+)?\.csv$",
+        path.name,
+    )
+    if not match:
+        return None, None
+    request_rate = float(match.group(1))
+    user_count = int(match.group(2)) if match.group(2) else None
+    return request_rate, user_count
 
 
 def load_latencies(path: Path) -> tuple[list[float], list[float]]:
@@ -65,12 +74,15 @@ def create_chart(csv_path: Path) -> tuple[int, float, float, Path] | None:
     p50 = percentile(sorted_latencies, 0.50)
     p95 = percentile(sorted_latencies, 0.95)
     p99 = percentile(sorted_latencies, 0.99)
-    request_rate = request_rate_from_filename(csv_path)
-    rate_label = (
-        f"target {request_rate:g} req/s"
-        if request_rate is not None
-        else "unknown target rate"
-    )
+    request_rate, user_count = metadata_from_filename(csv_path)
+    if request_rate is None:
+        rate_label = "unknown target rate"
+    elif user_count is None:
+        rate_label = f"target {request_rate:g} req/s"
+    else:
+        rate_label = (
+            f"target {request_rate:g} req/s, {user_count} users"
+        )
 
     figure, (timeline, histogram) = plt.subplots(
         2,
@@ -171,7 +183,15 @@ def create_chart(csv_path: Path) -> tuple[int, float, float, Path] | None:
     figure.savefig(output, dpi=150)
     plt.close(figure)
 
-    return len(latencies), request_rate, average, p95, p99, output
+    return (
+        len(latencies),
+        request_rate,
+        user_count,
+        average,
+        p95,
+        p99,
+        output,
+    )
 
 
 def main() -> None:
@@ -189,15 +209,26 @@ def main() -> None:
         if result is None:
             continue
 
-        requests, request_rate, average, p95, p99, output = result
+        (
+            requests,
+            request_rate,
+            user_count,
+            average,
+            p95,
+            p99,
+            output,
+        ) = result
         rate_text = (
             f"{request_rate:g} req/s"
             if request_rate is not None
             else "unknown rate"
         )
+        users_text = (
+            f", users={user_count}" if user_count is not None else ""
+        )
         print(
             f"[{index}/{len(csv_paths)}] {csv_path.name}: "
-            f"{requests} requests, target={rate_text}, "
+            f"{requests} requests, target={rate_text}{users_text}, "
             f"avg={average:.1f} ms, p95={p95:.1f} ms, "
             f"p99={p99:.1f} ms -> {output.name}"
         )
