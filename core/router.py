@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, Request, Response
 
 from base.db import get_pool
 from core.schema import OffersResponse
-from core.service import fetch_installed_app_ids, filter_uninstalled_app_ids
+from core.service import get_filtered_app_ids
 
 router = APIRouter()
 
@@ -27,11 +27,13 @@ async def get_offers(
 ) -> OffersResponse:
     """Return candidate apps the user has not installed yet."""
     started = time.perf_counter()
-    installed_app_ids = await fetch_installed_app_ids(pool, user_id)
+    app_ids, cache_hit = await get_filtered_app_ids(
+        pool,
+        user_id,
+        candidate_app_ids,
+    )
     db_elapsed_ms = (time.perf_counter() - started) * 1000
     response.headers["X-DB-Time-Ms"] = f"{db_elapsed_ms:.3f}"
+    response.headers["X-Cache"] = "HIT" if cache_hit else "MISS"
 
-    return OffersResponse(
-        user_id=user_id,
-        app_ids=filter_uninstalled_app_ids(candidate_app_ids, installed_app_ids),
-    )
+    return OffersResponse(user_id=user_id, app_ids=app_ids)
