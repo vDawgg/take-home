@@ -41,6 +41,7 @@ class Result:
     latency_ms: float
     process_ms: float | None
     db_ms: float | None
+    cache_status: str | None
     started_s: float
     finished_s: float
 
@@ -87,11 +88,13 @@ async def send_request(
     started_s = time.time() - worker_start
     process_ms = None
     db_ms = None
+    cache_status = None
     try:
         response = await client.get(url, params={"user_id": user_id})
         status_code = response.status_code
         process_ms = header_ms(response.headers, "x-process-time-ms")
         db_ms = header_ms(response.headers, "x-db-time-ms")
+        cache_status = response.headers.get("x-cache")
     except httpx.HTTPError:
         status_code = 0
     finished = time.perf_counter()
@@ -103,6 +106,7 @@ async def send_request(
         latency_ms=(finished - started) * 1000,
         process_ms=process_ms,
         db_ms=db_ms,
+        cache_status=cache_status,
         started_s=started_s,
         finished_s=time.time() - worker_start,
     )
@@ -270,6 +274,12 @@ def run_load_test(args: argparse.Namespace) -> list[Result]:
     db_times = sorted(
         result.db_ms for result in successful if result.db_ms is not None
     )
+    cache_hits = sum(
+        1 for result in successful if result.cache_status == "HIT"
+    )
+    cache_misses = sum(
+        1 for result in successful if result.cache_status == "MISS"
+    )
     failed = len(results) - len(successful)
 
     first_start = min(result.started_s for result in results)
@@ -294,6 +304,15 @@ def run_load_test(args: argparse.Namespace) -> list[Result]:
         f"Completion throughput: {completion_rate:.1f} req/s "
         f"(last response after {last_finish:.2f}s)"
     )
+
+    cache_total = cache_hits + cache_misses
+    if cache_total:
+        hit_rate = cache_hits / cache_total * 100
+        print(
+            f"DB calls: {cache_misses} "
+            f"(cache hits: {cache_hits}, misses: {cache_misses}, "
+            f"hit rate: {hit_rate:.1f}%)"
+        )
 
     if latencies:
         print_latency_stats("Client latency", latencies)
@@ -330,6 +349,7 @@ def write_results(results: list[Result], output: Path) -> None:
                 "latency_ms",
                 "process_ms",
                 "db_ms",
+                "cache_status",
                 "started_s",
                 "finished_s",
             ]
@@ -351,6 +371,7 @@ def write_results(results: list[Result], output: Path) -> None:
                         if result.db_ms is not None
                         else ""
                     ),
+                    result.cache_status or "",
                     f"{result.started_s:.6f}",
                     f"{result.finished_s:.6f}",
                 ]

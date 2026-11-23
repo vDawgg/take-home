@@ -50,7 +50,9 @@ def metadata_from_filename(
     return request_rate, user_count
 
 
-def load_latencies(path: Path) -> tuple[list[float], list[float]]:
+def load_latencies(
+    path: Path,
+) -> tuple[list[float], list[float], int, int]:
     with path.open(newline="") as file:
         rows = [
             row
@@ -60,11 +62,19 @@ def load_latencies(path: Path) -> tuple[list[float], list[float]]:
 
     started = [float(row["started_s"]) for row in rows]
     latencies = [float(row["latency_ms"]) for row in rows]
-    return started, latencies
+    cache_hits = sum(
+        1 for row in rows if row.get("cache_status") == "HIT"
+    )
+    cache_misses = sum(
+        1 for row in rows if row.get("cache_status") == "MISS"
+    )
+    return started, latencies, cache_hits, cache_misses
 
 
-def create_chart(csv_path: Path) -> tuple[int, float, float, Path] | None:
-    started, latencies = load_latencies(csv_path)
+def create_chart(
+    csv_path: Path,
+) -> tuple[int, float, int | None, float, float, float, int, int, Path] | None:
+    started, latencies, cache_hits, cache_misses = load_latencies(csv_path)
     if not latencies:
         print(f"Skipping {csv_path.name}: no successful requests")
         return None
@@ -90,10 +100,19 @@ def create_chart(csv_path: Path) -> tuple[int, float, float, Path] | None:
         figsize=(12, 8),
         constrained_layout=True,
     )
+    cache_total = cache_hits + cache_misses
+    cache_label = ""
+    if cache_total:
+        hit_rate = cache_hits / cache_total * 100
+        cache_label = (
+            f"\nDB calls: {cache_misses}, cache hit rate: {hit_rate:.1f}%"
+        )
+
     figure.suptitle(
         f"Offers latency - {rate_label}\n"
         f"{len(latencies)} requests, avg = {average:.1f} ms, "
         f"p95 = {p95:.1f} ms, p99 = {p99:.1f} ms"
+        f"{cache_label}"
     )
 
     timeline.plot(
@@ -190,6 +209,8 @@ def create_chart(csv_path: Path) -> tuple[int, float, float, Path] | None:
         average,
         p95,
         p99,
+        cache_hits,
+        cache_misses,
         output,
     )
 
@@ -216,6 +237,8 @@ def main() -> None:
             average,
             p95,
             p99,
+            cache_hits,
+            cache_misses,
             output,
         ) = result
         rate_text = (
@@ -226,11 +249,17 @@ def main() -> None:
         users_text = (
             f", users={user_count}" if user_count is not None else ""
         )
+        cache_text = ""
+        if cache_hits + cache_misses:
+            hit_rate = cache_hits / (cache_hits + cache_misses) * 100
+            cache_text = (
+                f", db_calls={cache_misses}, hit_rate={hit_rate:.1f}%"
+            )
         print(
             f"[{index}/{len(csv_paths)}] {csv_path.name}: "
             f"{requests} requests, target={rate_text}{users_text}, "
             f"avg={average:.1f} ms, p95={p95:.1f} ms, "
-            f"p99={p99:.1f} ms -> {output.name}"
+            f"p99={p99:.1f} ms{cache_text} -> {output.name}"
         )
 
 
