@@ -94,10 +94,10 @@ def create_chart(
             f"target {request_rate:g} req/s, {user_count} users"
         )
 
-    figure, (timeline, histogram) = plt.subplots(
-        2,
+    figure, timeline = plt.subplots(
         1,
-        figsize=(12, 8),
+        1,
+        figsize=(12, 4),
         constrained_layout=True,
     )
     cache_total = cache_hits + cache_misses
@@ -156,47 +156,6 @@ def create_chart(
     timeline.set_title("Latency over time")
     timeline.grid(alpha=0.3)
     timeline.legend()
-
-    bins = min(50, max(10, int(len(latencies) ** 0.5) * 2))
-    histogram.hist(
-        latencies,
-        bins=bins,
-        edgecolor="black",
-        alpha=0.7,
-    )
-    histogram.axvline(
-        average,
-        color="green",
-        linestyle="--",
-        linewidth=1.5,
-        label=f"avg = {average:.1f} ms",
-    )
-    histogram.axvline(
-        p50,
-        color="orange",
-        linestyle=":",
-        linewidth=1.5,
-        label=f"p50 = {p50:.1f} ms",
-    )
-    histogram.axvline(
-        p95,
-        color="red",
-        linestyle="--",
-        linewidth=1.5,
-        label=f"p95 = {p95:.1f} ms",
-    )
-    histogram.axvline(
-        p99,
-        color="purple",
-        linestyle="-.",
-        linewidth=1.5,
-        label=f"p99 = {p99:.1f} ms",
-    )
-    histogram.set_xlabel("Latency (ms)")
-    histogram.set_ylabel("Requests")
-    histogram.set_title("Latency distribution")
-    histogram.grid(alpha=0.3)
-    histogram.legend()
 
     output = csv_path.with_suffix(".pdf")
     figure.savefig(output, dpi=150)
